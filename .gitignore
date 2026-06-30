@@ -1,0 +1,19 @@
+.venv/
+venv/
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+dist/
+build/
+.DS_Store
+
+# Local datastore and generated reports
+data/
+*.db
+
+# Secrets
+.env
+.env.*
+*.local
+secrets*
