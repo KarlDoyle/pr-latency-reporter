@@ -22,6 +22,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
 import urllib.error
@@ -42,8 +43,22 @@ from zoneinfo import ZoneInfo
 # GitHub (required for live collection)
 GH_TOKEN = "" or os.getenv("GH_TOKEN", "")
 GH_ORG = "" or os.getenv("GH_ORG", "")  # e.g. "acme-corp"
-TEAM_SLUG = "" or os.getenv("TEAM_SLUG", "")  # e.g. "your-team"
+TEAM_SLUG = "" or os.getenv("TEAM_SLUG", "")  # e.g. "your-team" (single-team; kept for back-compat)
+# Multi-team, director/TPM-level observation: comma-separated team slugs, e.g.
+# "platform-team,checkout-team,mobile-team". Falls back to TEAM_SLUG if unset,
+# so a single-team setup keeps working unchanged.
+TEAM_SLUGS = "" or os.getenv("TEAM_SLUGS", "")
 GH_API = os.getenv("GH_API", "https://api.github.com")
+
+# Reviewer seniority map for the "are seniors leading on review" thesis.
+# Format: "login:tier,login:tier", e.g. "alice:senior,bob:mid,carol:senior".
+# Reviewers not listed fall back to the "unspecified" tier. Neutral by design —
+# never commit real logins/tiers here; set via env var per deployment.
+REVIEWER_SENIORITY = "" or os.getenv("REVIEWER_SENIORITY", "")
+
+# Defect-escape detection window: how many days after merge a "Revert" PR
+# referencing the merge commit still counts as a defect escape.
+DEFECT_LOOKBACK_DAYS = int(os.getenv("DEFECT_LOOKBACK_DAYS", "14"))
 
 # Slack (required to post; bypassed by --dry-run)
 SLACK_BOT_TOKEN = "" or os.getenv("SLACK_BOT_TOKEN", "")
@@ -84,6 +99,7 @@ class Config:
     gh_token: str = GH_TOKEN
     gh_org: str = GH_ORG
     team_slug: str = TEAM_SLUG
+    team_slugs: tuple[str, ...] = field(default_factory=tuple)
     gh_api: str = GH_API
     slack_bot_token: str = SLACK_BOT_TOKEN
     slack_channel_id: str = SLACK_CHANNEL_ID
@@ -97,6 +113,20 @@ class Config:
     data_dir: str = DATA_DIR
     db_name: str = DB_NAME
     backfill_days: int = DEFAULT_BACKFILL_DAYS
+    reviewer_seniority: dict[str, str] = field(default_factory=dict)
+    defect_lookback_days: int = DEFECT_LOOKBACK_DAYS
+
+    def __post_init__(self) -> None:
+        # Multi-team is additive: TEAM_SLUGS wins when set, otherwise fall
+        # back to the single legacy TEAM_SLUG so existing deployments are
+        # unaffected. Either way `teams` is the one list the rest of the
+        # code should iterate over.
+        if not self.team_slugs and self.team_slug:
+            self.team_slugs = (self.team_slug,)
+
+    @property
+    def teams(self) -> tuple[str, ...]:
+        return self.team_slugs
 
     @property
     def tz(self) -> ZoneInfo:
@@ -106,6 +136,9 @@ class Config:
     def db_path(self) -> str:
         return os.path.join(self.data_dir, self.db_name)
 
+    def seniority_of(self, login: str) -> str:
+        return self.reviewer_seniority.get(login, "unspecified")
+
     def missing_required(self, *, need_slack: bool) -> list[str]:
         """Return the names of required secrets/settings that are absent."""
         missing = []
@@ -113,8 +146,8 @@ class Config:
             missing.append("GH_TOKEN")
         if not self.gh_org:
             missing.append("GH_ORG")
-        if not self.team_slug:
-            missing.append("TEAM_SLUG")
+        if not self.team_slugs:
+            missing.append("TEAM_SLUG or TEAM_SLUGS")
         if need_slack:
             if not self.slack_bot_token:
                 missing.append("SLACK_BOT_TOKEN")
@@ -134,8 +167,37 @@ def parse_holidays(raw: str) -> frozenset[date]:
     return frozenset(out)
 
 
+def parse_team_slugs(raw: str) -> tuple[str, ...]:
+    """Parse a comma-separated team-slug list, de-duplicated, order preserved."""
+    seen: dict[str, None] = {}
+    for token in raw.split(","):
+        token = token.strip()
+        if token:
+            seen[token] = None
+    return tuple(seen)
+
+
+def parse_reviewer_seniority(raw: str) -> dict[str, str]:
+    """Parse ``login:tier,login:tier`` into a ``{login: tier}`` map."""
+    out: dict[str, str] = {}
+    for token in raw.split(","):
+        token = token.strip()
+        if not token or ":" not in token:
+            continue
+        login, _, tier = token.partition(":")
+        login = login.strip()
+        tier = tier.strip()
+        if login and tier:
+            out[login] = tier
+    return out
+
+
 def load_config() -> Config:
-    return Config(holidays=parse_holidays(HOLIDAYS_YYYYMMDD))
+    return Config(
+        holidays=parse_holidays(HOLIDAYS_YYYYMMDD),
+        team_slugs=parse_team_slugs(TEAM_SLUGS),
+        reviewer_seniority=parse_reviewer_seniority(REVIEWER_SENIORITY),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -244,9 +306,64 @@ def rework_rate_pct(changes_requested: Sequence[bool]) -> float:
 
 
 def defect_escape_pct(defect_flags: Sequence[bool]) -> float:
+    """% of merged PRs whose ``defect_flag`` is set.
+
+    ``defect_flag`` is a real, GitHub-Revert-based signal (see
+    ``defect_escape_shas`` below) — NOT a synthetic/hardcoded value. It was
+    previously hardcoded to 0 at build time, which made this function always
+    return 0.0% with no signal behind it. It is a deliberate LOWER BOUND: it
+    only catches merges reverted via GitHub's own "Revert" PR flow (or a PR
+    titled/bodied the same way) within ``defect_lookback_days`` of the
+    original merge. A hotfix that doesn't reference the original commit, or a
+    revert outside the lookback window, will not be counted. Documented in
+    the README rather than presented as complete.
+    """
     if not defect_flags:
         return 0.0
     return 100.0 * sum(1 for d in defect_flags if d) / len(defect_flags)
+
+
+REVERT_SHA_RE = re.compile(r"This reverts commit ([0-9a-fA-F]{7,40})")
+
+
+def extract_reverted_sha(body: str | None) -> str | None:
+    """Parse the reverted commit SHA out of a GitHub-generated revert-PR body.
+
+    GitHub's "Revert" button always produces a body containing
+    ``This reverts commit <sha>.`` — a stable, first-party marker we can rely
+    on without any heuristics. A manually authored revert PR that doesn't
+    include that exact line is not detected (documented limitation).
+    """
+    if not body:
+        return None
+    m = REVERT_SHA_RE.search(body)
+    return m.group(1)[:7] if m else None
+
+
+def defect_escape_shas(revert_items: Iterable[dict]) -> set[str]:
+    """Short (7-char) SHAs reverted by any PR in ``revert_items``.
+
+    ``revert_items`` are GitHub search-API PR items (must include ``body``).
+    Matching against ``PRRecord.merge_commit_sha[:7]`` is how ``defect_flag``
+    gets set — see ``search_revert_prs`` / ``apply_defect_flags``.
+    """
+    shas: set[str] = set()
+    for item in revert_items:
+        sha = extract_reverted_sha(item.get("body"))
+        if sha:
+            shas.add(sha)
+    return shas
+
+
+def apply_defect_flags(records: Sequence[PRRecord], reverted_shas: set[str]) -> None:
+    """Set ``defect_flag`` in place for any merged record whose
+    ``merge_commit_sha`` (short form) was reverted. Pure w.r.t. its inputs
+    other than mutating the records it's handed — mirrors how ``collect_prs``
+    already builds records before storing them.
+    """
+    for record in records:
+        if record.merge_commit_sha and record.merge_commit_sha[:7] in reverted_shas:
+            record.defect_flag = 1
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +390,16 @@ class PRRecord:
     sla_response_met: int = 0
     sla_approval_met: int = 0
     updated_at: str | None = None
+    team_slug: str = ""
+    # Reviewer attribution (fixes the "who reviewed" gap): the GitHub login of
+    # whoever gave the first response/approval. Needed for the per-reviewer
+    # and per-seniority "are seniors leading" metrics — see ReviewEvent below
+    # for the full per-review detail these are drawn from.
+    first_responder_login: str = ""
+    first_approver_login: str = ""
+    # Merge commit SHA, used to match this PR against later "Revert" PRs for
+    # the (honest, lower-bound) defect-escape signal. See defect_escape_shas().
+    merge_commit_sha: str = ""
 
     def as_row(self) -> tuple:
         return (
@@ -293,7 +420,28 @@ class PRRecord:
             self.sla_response_met,
             self.sla_approval_met,
             self.updated_at,
+            self.team_slug,
+            self.first_responder_login,
+            self.first_approver_login,
+            self.merge_commit_sha,
         )
+
+
+@dataclass
+class ReviewEvent:
+    """One individual review, attributed to its reviewer. This is the record
+    that fixes defect #1: the old code discarded ``review.user.login``
+    entirely and only ever stored the PR *author*. Every review on a PR
+    produces one of these, so per-reviewer and per-seniority metrics are
+    computed from real per-reviewer data, not inferred from the PR record.
+    """
+
+    repo: str
+    number: int
+    reviewer: str
+    state: str
+    submitted_at: str | None
+    response_bh: float | None  # business hours from the review-request anchor
 
 
 def repo_full_name_from_url(repository_url: str) -> str:
@@ -320,32 +468,111 @@ def latest_team_review_request(events: Iterable[dict], team_slug: str) -> dateti
     return latest
 
 
-def summarise_reviews(reviews: Iterable[dict]) -> tuple[datetime | None, datetime | None, bool]:
-    """Return (first_review_at, first_approval_at, any_changes_requested)."""
+def latest_team_review_request_multi(
+    events: Iterable[dict], team_slugs: Iterable[str]
+) -> tuple[datetime | None, str]:
+    """Latest ``review_requested`` event across any of ``team_slugs``.
+
+    Returns ``(when, team_slug)`` for whichever team's request is latest, or
+    ``(None, "")`` if none of the configured teams were ever requested.
+    Enables multi-team observation without changing the single-team
+    ``latest_team_review_request`` primitive above (kept, and still tested,
+    as the per-team building block).
+    """
+    events = list(events)
+    best_when: datetime | None = None
+    best_team = ""
+    for team in team_slugs:
+        when = latest_team_review_request(events, team)
+        if when and (best_when is None or when > best_when):
+            best_when = when
+            best_team = team
+    return best_when, best_team
+
+
+def summarise_reviews(
+    reviews: Iterable[dict],
+) -> tuple[datetime | None, str, datetime | None, str, bool]:
+    """Return (first_review_at, first_review_login, first_approval_at,
+    first_approval_login, any_changes_requested).
+
+    Captures ``review.user.login`` for both the first response and the first
+    approval — this is the reviewer-attribution fix. Previously this function
+    (and the record it fed) never read the login at all.
+    """
     first_review: datetime | None = None
+    first_review_login = ""
     first_approval: datetime | None = None
+    first_approval_login = ""
     changes_requested = False
     for review in reviews:
         when = parse_iso8601(review.get("submitted_at"))
         if when is None:
             continue
+        login = (review.get("user") or {}).get("login", "")
         if first_review is None or when < first_review:
             first_review = when
+            first_review_login = login
         state = (review.get("state") or "").upper()
         if state == "APPROVED" and (first_approval is None or when < first_approval):
             first_approval = when
+            first_approval_login = login
         if state == "CHANGES_REQUESTED":
             changes_requested = True
-    return first_review, first_approval, changes_requested
+    return first_review, first_review_login, first_approval, first_approval_login, changes_requested
 
 
-def earliest_comment(comments: Iterable[dict]) -> datetime | None:
+def build_review_events(
+    repo: str,
+    number: int,
+    reviews: Iterable[dict],
+    anchor: datetime | None,
+    cfg: Config,
+) -> list[ReviewEvent]:
+    """One ``ReviewEvent`` per review, each attributed to its reviewer login.
+
+    This is the full per-reviewer detail behind the per-seniority rollup
+    (``reviewer_aggregate`` / ``seniority_rollup``) — every review counts,
+    not just the first response/approval kept on ``PRRecord``.
+    """
+    out: list[ReviewEvent] = []
+    for review in reviews:
+        when = parse_iso8601(review.get("submitted_at"))
+        login = (review.get("user") or {}).get("login", "")
+        if not login:
+            continue
+        response_bh = None
+        if anchor and when:
+            response_bh = business_hours_between(
+                anchor,
+                when,
+                cfg.tz,
+                start_hour=cfg.business_start_hour,
+                end_hour=cfg.business_end_hour,
+                holidays=cfg.holidays,
+            )
+        out.append(
+            ReviewEvent(
+                repo=repo,
+                number=number,
+                reviewer=login,
+                state=(review.get("state") or "").upper(),
+                submitted_at=to_iso8601(when),
+                response_bh=response_bh,
+            )
+        )
+    return out
+
+
+def earliest_comment(comments: Iterable[dict]) -> tuple[datetime | None, str]:
     earliest: datetime | None = None
+    login = ""
     for comment in comments:
         when = parse_iso8601(comment.get("created_at"))
         if when and (earliest is None or when < earliest):
             earliest = when
-    return earliest
+            login = (comment.get("user") or {}).get("login", "")
+    return earliest, login
 
 
 def build_pr_record(
@@ -354,17 +581,27 @@ def build_pr_record(
     reviews: Iterable[dict],
     comments: Iterable[dict],
     cfg: Config,
+    *,
+    merge_commit_sha: str = "",
 ) -> PRRecord:
     """Combine raw GitHub payloads into a metric-bearing PRRecord. Pure."""
     repo = repo_full_name_from_url(item.get("repository_url", ""))
-    review_requested_at = latest_team_review_request(events, cfg.team_slug)
-    first_review_at, first_approval_at, changes_requested = summarise_reviews(reviews)
-    comment_at = earliest_comment(comments)
+    review_requested_at, matched_team = latest_team_review_request_multi(events, cfg.teams)
+    (
+        first_review_at,
+        first_review_login,
+        first_approval_at,
+        first_approval_login,
+        changes_requested,
+    ) = summarise_reviews(reviews)
+    comment_at, comment_login = earliest_comment(comments)
 
     # First response = earliest of first review (any state) and first comment.
     first_response_at = first_review_at
+    first_responder_login = first_review_login
     if comment_at and (first_response_at is None or comment_at < first_response_at):
         first_response_at = comment_at
+        first_responder_login = comment_login
 
     # Anchor for latency: the review request, falling back to PR creation.
     anchor = review_requested_at or parse_iso8601(item.get("created_at"))
@@ -405,12 +642,16 @@ def build_pr_record(
         first_approval_at=to_iso8601(first_approval_at),
         merged_at=to_iso8601(parse_iso8601(pr.get("merged_at"))),
         changes_requested=int(changes_requested),
-        defect_flag=0,
+        defect_flag=0,  # set later, in a separate pass — see defect_escape_shas()
         ttfr_bh=ttfr,
         tta_bh=tta,
         sla_response_met=sla_response_met,
         sla_approval_met=sla_approval_met,
         updated_at=to_iso8601(parse_iso8601(item.get("updated_at"))),
+        team_slug=matched_team,
+        first_responder_login=first_responder_login,
+        first_approver_login=first_approval_login,
+        merge_commit_sha=merge_commit_sha,
     )
 
 
@@ -460,6 +701,133 @@ def aggregate(records: Sequence[PRRecord], cfg: Config) -> Aggregate:
     )
 
 
+@dataclass
+class TeamAggregate:
+    """One team's slice of the multi-team rollup. Director/TPM-level
+    observation across teams — not a single-team performance verdict.
+    """
+
+    team_slug: str
+    agg: Aggregate
+
+
+def aggregate_by_team(records: Sequence[PRRecord], cfg: Config) -> list[TeamAggregate]:
+    """Group records by ``team_slug`` and aggregate each group.
+
+    Any record with no matched team (``team_slug == ""`` — e.g. anchored on
+    PR creation because no configured team was ever requested) is grouped
+    under ``"unassigned"`` rather than dropped, so nothing is silently
+    excluded from the multi-team view. Sorted by team slug for a stable,
+    non-editorialising order (not ranked "best"/"worst").
+    """
+    by_team: dict[str, list[PRRecord]] = {}
+    for r in records:
+        key = r.team_slug or "unassigned"
+        by_team.setdefault(key, []).append(r)
+    return [
+        TeamAggregate(team_slug=team, agg=aggregate(recs, cfg))
+        for team, recs in sorted(by_team.items())
+    ]
+
+
+@dataclass
+class ReviewerStat:
+    """Per-reviewer rollup — the data behind "are seniors leading on
+    review". Built from ``ReviewEvent`` rows, i.e. real per-reviewer
+    attribution, not the PR author (the bug this fixes).
+    """
+
+    reviewer: str
+    seniority: str
+    review_count: int
+    approval_count: int
+    median_response_bh: float
+
+
+def reviewer_aggregate(events: Sequence[ReviewEvent], cfg: Config) -> list[ReviewerStat]:
+    """Aggregate per-reviewer stats from a set of ``ReviewEvent`` rows."""
+    by_reviewer: dict[str, list[ReviewEvent]] = {}
+    for e in events:
+        by_reviewer.setdefault(e.reviewer, []).append(e)
+    out = []
+    for reviewer, evs in sorted(by_reviewer.items()):
+        response_times = [e.response_bh for e in evs if e.response_bh is not None]
+        out.append(
+            ReviewerStat(
+                reviewer=reviewer,
+                seniority=cfg.seniority_of(reviewer),
+                review_count=len(evs),
+                approval_count=sum(1 for e in evs if e.state == "APPROVED"),
+                median_response_bh=median_or_zero(response_times),
+            )
+        )
+    return out
+
+
+@dataclass
+class SeniorityStat:
+    """One seniority tier's slice of review activity — the measurable
+    version of "are seniors leading on review": what share of reviews and
+    first approvals come from the senior tier, and how fast.
+    """
+
+    tier: str
+    reviewer_count: int
+    review_count: int
+    median_response_bh: float
+    share_of_reviews_pct: float
+    share_of_first_approvals_pct: float
+
+
+def seniority_rollup(
+    events: Sequence[ReviewEvent], records: Sequence[PRRecord], cfg: Config
+) -> list[SeniorityStat]:
+    """Roll per-reviewer stats up to seniority tiers.
+
+    ``share_of_first_approvals_pct`` is computed from ``PRRecord.
+    first_approver_login`` (one first-approver per merged/approved PR);
+    ``share_of_reviews_pct`` counts every individual review. Both are real
+    numbers over real attribution — this is what makes the "are seniors
+    leading" thesis measurable instead of asserted.
+    """
+    total_reviews = len(events)
+    approvers = [r.first_approver_login for r in records if r.first_approver_login]
+    total_approvals = len(approvers)
+
+    by_tier: dict[str, list[ReviewEvent]] = {}
+    reviewers_by_tier: dict[str, set[str]] = {}
+    for e in events:
+        tier = cfg.seniority_of(e.reviewer)
+        by_tier.setdefault(tier, []).append(e)
+        reviewers_by_tier.setdefault(tier, set()).add(e.reviewer)
+
+    approvals_by_tier: dict[str, int] = {}
+    for login in approvers:
+        tier = cfg.seniority_of(login)
+        approvals_by_tier[tier] = approvals_by_tier.get(tier, 0) + 1
+
+    tiers = set(by_tier) | set(approvals_by_tier)
+    out = []
+    for tier in sorted(tiers):
+        evs = by_tier.get(tier, [])
+        response_times = [e.response_bh for e in evs if e.response_bh is not None]
+        out.append(
+            SeniorityStat(
+                tier=tier,
+                reviewer_count=len(reviewers_by_tier.get(tier, set())),
+                review_count=len(evs),
+                median_response_bh=median_or_zero(response_times),
+                share_of_reviews_pct=(100.0 * len(evs) / total_reviews if total_reviews else 0.0),
+                share_of_first_approvals_pct=(
+                    100.0 * approvals_by_tier.get(tier, 0) / total_approvals
+                    if total_approvals
+                    else 0.0
+                ),
+            )
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Storage — append-only SQLite event log + queryable current-state projection
 # ---------------------------------------------------------------------------
@@ -491,7 +859,20 @@ CREATE TABLE IF NOT EXISTS prs (
     sla_response_met INTEGER DEFAULT 0,
     sla_approval_met INTEGER DEFAULT 0,
     updated_at TEXT,
+    team_slug TEXT DEFAULT '',
+    first_responder_login TEXT DEFAULT '',
+    first_approver_login TEXT DEFAULT '',
+    merge_commit_sha TEXT DEFAULT '',
     PRIMARY KEY (repo, number)
+);
+CREATE TABLE IF NOT EXISTS pr_reviews (
+    repo TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    reviewer TEXT NOT NULL,
+    state TEXT,
+    submitted_at TEXT,
+    response_bh REAL,
+    PRIMARY KEY (repo, number, reviewer, submitted_at)
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -554,8 +935,9 @@ class Store:
                 repo, number, title, author, html_url, created_at,
                 review_requested_at, first_response_at, first_approval_at, merged_at,
                 changes_requested, defect_flag, ttfr_bh, tta_bh,
-                sla_response_met, sla_approval_met, updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                sla_response_met, sla_approval_met, updated_at,
+                team_slug, first_responder_login, first_approver_login, merge_commit_sha
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(repo, number) DO UPDATE SET
                 title=excluded.title,
                 author=excluded.author,
@@ -571,9 +953,31 @@ class Store:
                 tta_bh=excluded.tta_bh,
                 sla_response_met=excluded.sla_response_met,
                 sla_approval_met=excluded.sla_approval_met,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                team_slug=excluded.team_slug,
+                first_responder_login=excluded.first_responder_login,
+                first_approver_login=excluded.first_approver_login,
+                merge_commit_sha=excluded.merge_commit_sha
             """,
             record.as_row(),
+        )
+        self.conn.commit()
+
+    def replace_reviews(self, repo: str, number: int, events: Sequence[ReviewEvent]) -> None:
+        """Replace all stored ``ReviewEvent`` rows for one PR with ``events``.
+
+        Delete+insert (rather than upsert) because re-collecting a PR can
+        change which reviews exist (e.g. a dismissed review); the current
+        set from GitHub is always the source of truth for the projection.
+        """
+        self.conn.execute("DELETE FROM pr_reviews WHERE repo = ? AND number = ?", (repo, number))
+        self.conn.executemany(
+            "INSERT INTO pr_reviews(repo, number, reviewer, state, submitted_at, response_bh) "
+            "VALUES(?,?,?,?,?,?)",
+            [
+                (e.repo, e.number, e.reviewer, e.state, e.submitted_at, e.response_bh)
+                for e in events
+            ],
         )
         self.conn.commit()
 
@@ -592,6 +996,7 @@ class Store:
 
     # -- reads -----------------------------------------------------------
     def _row_to_record(self, row: sqlite3.Row) -> PRRecord:
+        keys = row.keys()
         return PRRecord(
             repo=row["repo"],
             number=row["number"],
@@ -610,6 +1015,24 @@ class Store:
             sla_response_met=row["sla_response_met"],
             sla_approval_met=row["sla_approval_met"],
             updated_at=row["updated_at"],
+            team_slug=row["team_slug"] if "team_slug" in keys else "",
+            first_responder_login=(
+                row["first_responder_login"] if "first_responder_login" in keys else ""
+            ),
+            first_approver_login=(
+                row["first_approver_login"] if "first_approver_login" in keys else ""
+            ),
+            merge_commit_sha=row["merge_commit_sha"] if "merge_commit_sha" in keys else "",
+        )
+
+    def _row_to_review_event(self, row: sqlite3.Row) -> ReviewEvent:
+        return ReviewEvent(
+            repo=row["repo"],
+            number=row["number"],
+            reviewer=row["reviewer"],
+            state=row["state"],
+            submitted_at=row["submitted_at"],
+            response_bh=row["response_bh"],
         )
 
     def fetch_between(self, start: datetime, end: datetime) -> list[PRRecord]:
@@ -626,6 +1049,16 @@ class Store:
     def fetch_all(self) -> list[PRRecord]:
         rows = self.conn.execute("SELECT * FROM prs ORDER BY repo, number").fetchall()
         return [self._row_to_record(r) for r in rows]
+
+    def fetch_reviews_for(self, records: Sequence[PRRecord]) -> list[ReviewEvent]:
+        """All stored ``ReviewEvent`` rows for the given PR records."""
+        out: list[ReviewEvent] = []
+        for r in records:
+            rows = self.conn.execute(
+                "SELECT * FROM pr_reviews WHERE repo = ? AND number = ?", (r.repo, r.number)
+            ).fetchall()
+            out.extend(self._row_to_review_event(row) for row in rows)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -657,10 +1090,8 @@ def http_json(
     return json.loads(body.decode("utf-8")) if body else {}
 
 
-def search_review_requested(cfg: Config, since: datetime) -> list[dict]:
-    """Search PRs where the team was requested to review, updated since ``since``."""
-    since_str = since.astimezone(timezone.utc).strftime("%Y-%m-%d")
-    query = f"is:pr team-review-requested:{cfg.gh_org}/{cfg.team_slug} updated:>={since_str}"
+def _search_issues(cfg: Config, query: str) -> list[dict]:
+    """Paginate the GitHub Search (issues/PRs) API for one query."""
     items: list[dict] = []
     page = 1
     while True:
@@ -674,8 +1105,41 @@ def search_review_requested(cfg: Config, since: datetime) -> list[dict]:
     return items
 
 
-def fetch_pr_detail(cfg: Config, repo: str, number: int) -> tuple[list, list, list]:
-    """Return (events, reviews, comments) for one PR."""
+def search_review_requested(cfg: Config, since: datetime) -> list[dict]:
+    """Search PRs where any configured team was requested to review, updated
+    since ``since``. Multi-team: one search query per team slug (GitHub's
+    ``team-review-requested`` filter only accepts one team), de-duplicated by
+    PR URL so a PR requested from two configured teams isn't double-counted.
+    """
+    since_str = since.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    seen: dict[str, dict] = {}
+    for team in cfg.teams:
+        query = f"is:pr team-review-requested:{cfg.gh_org}/{team} updated:>={since_str}"
+        for item in _search_issues(cfg, query):
+            seen.setdefault(item.get("html_url", item.get("url", "")), item)
+    return list(seen.values())
+
+
+def search_revert_prs(cfg: Config, since: datetime) -> list[dict]:
+    """Search merged, revert-titled PRs org-wide since ``since``.
+
+    Feeds the real (lower-bound) defect-escape signal — see
+    ``defect_escape_shas`` / ``extract_reverted_sha``. One query for the
+    whole org rather than per-PR, to keep this a single extra call per
+    collection cycle instead of N+1.
+    """
+    since_str = since.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    query = f'is:pr is:merged org:{cfg.gh_org} "Revert " in:title merged:>={since_str}'
+    return _search_issues(cfg, query)
+
+
+def fetch_pr_detail(cfg: Config, repo: str, number: int) -> tuple[list, list, list, dict]:
+    """Return (events, reviews, comments, pr_detail) for one PR.
+
+    ``pr_detail`` is the full ``/pulls/{number}`` object — fetched so
+    ``merge_commit_sha`` is available for defect-escape matching (the search
+    API's issue item does not include it).
+    """
     events = http_json(
         f"{cfg.gh_api}/repos/{repo}/issues/{number}/events?per_page=100",
         token=cfg.gh_token,
@@ -688,23 +1152,53 @@ def fetch_pr_detail(cfg: Config, repo: str, number: int) -> tuple[list, list, li
         f"{cfg.gh_api}/repos/{repo}/issues/{number}/comments?per_page=100",
         token=cfg.gh_token,
     )
-    # Endpoints return JSON arrays; http_json returns {} only for empty bodies.
+    pr_detail = http_json(
+        f"{cfg.gh_api}/repos/{repo}/pulls/{number}",
+        token=cfg.gh_token,
+    )
+    # List endpoints return JSON arrays; http_json returns {} only for empty
+    # bodies. The single-PR detail endpoint returns an object.
     return (
         events if isinstance(events, list) else [],
         reviews if isinstance(reviews, list) else [],
         comments if isinstance(comments, list) else [],
+        pr_detail if isinstance(pr_detail, dict) else {},
     )
 
 
-def collect_prs(cfg: Config, since: datetime) -> list[PRRecord]:
-    """Collect and compute PR records from GitHub since ``since``."""
+@dataclass
+class CollectResult:
+    """What one collection cycle produced: the PR records (with defect flags
+    already applied) and the full per-reviewer event log behind them.
+    """
+
+    records: list[PRRecord]
+    review_events: list[ReviewEvent]
+
+
+def collect_prs(cfg: Config, since: datetime) -> CollectResult:
+    """Collect and compute PR records + per-reviewer events from GitHub
+    since ``since``, across every configured team, with real defect-escape
+    flags applied (see ``defect_escape_shas``).
+    """
     records: list[PRRecord] = []
+    review_events: list[ReviewEvent] = []
     for item in search_review_requested(cfg, since):
         repo = repo_full_name_from_url(item.get("repository_url", ""))
         number = int(item["number"])
-        events, reviews, comments = fetch_pr_detail(cfg, repo, number)
-        records.append(build_pr_record(item, events, reviews, comments, cfg))
-    return records
+        events, reviews, comments, pr_detail = fetch_pr_detail(cfg, repo, number)
+        merge_commit_sha = pr_detail.get("merge_commit_sha") or ""
+        record = build_pr_record(
+            item, events, reviews, comments, cfg, merge_commit_sha=merge_commit_sha
+        )
+        records.append(record)
+        anchor = parse_iso8601(record.review_requested_at) or parse_iso8601(record.created_at)
+        review_events.extend(build_review_events(repo, number, reviews, anchor, cfg))
+
+    reverted_shas = defect_escape_shas(search_revert_prs(cfg, since))
+    apply_defect_flags(records, reverted_shas)
+
+    return CollectResult(records=records, review_events=review_events)
 
 
 def post_slack(cfg: Config, text: str) -> dict:
@@ -728,19 +1222,38 @@ def fmt_hours(value: float) -> str:
     return f"{value:.1f}h"
 
 
-def render_weekly_digest(agg: Aggregate, week_label: str, cfg: Config) -> str:
-    """Slack-flavoured weekly digest text."""
+def render_weekly_digest(
+    agg: Aggregate,
+    week_label: str,
+    cfg: Config,
+    team_aggs: Sequence[TeamAggregate] = (),
+) -> str:
+    """Slack-flavoured weekly digest text.
+
+    Director/TPM-level awareness across teams, not a single-team verdict —
+    ``team_aggs`` (from ``aggregate_by_team``) adds a neutral per-team
+    breakdown, listed in a stable slug order rather than ranked "best" to
+    "worst".
+    """
+    teams_note = f" — {len(team_aggs)} teams" if len(team_aggs) > 1 else ""
     lines = [
-        f"*Weekly PR Review Metrics ({week_label})*",
+        f"*Weekly PR Review Metrics ({week_label}){teams_note}*",
         f"- Median Time to First Response: {fmt_hours(agg.median_ttfr)}",
         f"- Median Time to Approval: {fmt_hours(agg.median_tta)}",
         f"- SLA Compliance (<={cfg.sla_approval_hrs:g}h approval): {agg.sla_approval_pct:.0f}%",
         f"- P95 Latency: {fmt_hours(agg.p95_tta)}",
         f"- Total PRs: {agg.total}",
-        f"- SLA Breaches: {len(agg.breaches)}",
+        f"- Latency Outliers (>{cfg.sla_approval_hrs:g}h approval): {len(agg.breaches)}",
     ]
+    if len(team_aggs) > 1:
+        lines.append("*By team (awareness, not a ranking):*")
+        for ta in team_aggs:
+            lines.append(
+                f"- {ta.team_slug}: {ta.agg.total} PRs, "
+                f"median TTA {fmt_hours(ta.agg.median_tta)}, SLA {ta.agg.sla_approval_pct:.0f}%"
+            )
     if agg.breaches:
-        lines.append("*Breaches:*")
+        lines.append("*Slowest to approve:*")
         for pr in agg.breaches[:10]:
             lines.append(
                 f"- <{pr.html_url}|{pr.repo} #{pr.number}> "
@@ -749,8 +1262,21 @@ def render_weekly_digest(agg: Aggregate, week_label: str, cfg: Config) -> str:
     return "\n".join(lines)
 
 
-def render_monthly_summary(agg: Aggregate, month_label: str, cfg: Config) -> str:
-    """Leadership-facing monthly Markdown summary with optional baseline."""
+def render_monthly_summary(
+    agg: Aggregate,
+    month_label: str,
+    cfg: Config,
+    *,
+    team_aggs: Sequence[TeamAggregate] = (),
+    seniority_stats: Sequence[SeniorityStat] = (),
+) -> str:
+    """Leadership-facing monthly Markdown summary with optional baseline.
+
+    Framed for someone overseeing multiple teams (director/TPM-level
+    awareness), not a single-team performance callout — per Karl's direction:
+    team-level managers get defensive about this data on their specific team;
+    senior leadership found it valuable as a validation/awareness signal.
+    """
     baseline_bits = []
     if BASELINE_TTA_HRS:
         baseline_bits.append(f"median TTA {BASELINE_TTA_HRS}h")
@@ -760,30 +1286,62 @@ def render_monthly_summary(agg: Aggregate, month_label: str, cfg: Config) -> str
         baseline_bits.append(f"P95 {BASELINE_P95_HRS}h")
     baseline_text = f" (baseline: {', '.join(baseline_bits)})" if baseline_bits else ""
 
-    return "\n".join(
-        [
-            f"# Monthly Review Metrics - {month_label}",
-            "",
-            "**Headline**",
-            f"Median TTA: {fmt_hours(agg.median_tta)}. "
-            f"P95 TTA: {fmt_hours(agg.p95_tta)}. "
-            f"SLA: {agg.sla_approval_pct:.0f}%.{baseline_text}",
-            "",
-            "**Metrics**",
-            f"- Median Time to Approval (TTA): {fmt_hours(agg.median_tta)}",
-            f"- Median Time to First Response (TTFR): {fmt_hours(agg.median_ttfr)}",
-            f"- SLA Compliance (<={cfg.sla_approval_hrs:g}h): {agg.sla_approval_pct:.0f}%",
-            f"- P95 TTA: {fmt_hours(agg.p95_tta)}",
-            f"- Rework Rate: {agg.rework_pct:.0f}%",
-            f"- Defect Escape Rate: {agg.defect_pct:.1f}%",
-            f"- Total PRs: {agg.total}",
-            "",
-            "**What this means**",
-            "Faster reviews reduce waiting time and keep delivery moving. "
-            "Outliers remain but no drop in quality observed.",
-            "",
-        ]
-    )
+    lines = [
+        f"# Monthly Review Metrics - {month_label}",
+        "",
+        "_Multi-team awareness signal for whoever is overseeing more than one "
+        "team — not a single-team performance verdict._",
+        "",
+        "**Headline**",
+        f"Median TTA: {fmt_hours(agg.median_tta)}. "
+        f"P95 TTA: {fmt_hours(agg.p95_tta)}. "
+        f"SLA: {agg.sla_approval_pct:.0f}%.{baseline_text}",
+        "",
+        "**Metrics**",
+        f"- Median Time to Approval (TTA): {fmt_hours(agg.median_tta)}",
+        f"- Median Time to First Response (TTFR): {fmt_hours(agg.median_ttfr)}",
+        f"- SLA Compliance (<={cfg.sla_approval_hrs:g}h): {agg.sla_approval_pct:.0f}%",
+        f"- P95 TTA: {fmt_hours(agg.p95_tta)}",
+        f"- Rework Rate: {agg.rework_pct:.0f}%",
+        f"- Defect Escape Rate (revert-based, lower bound): {agg.defect_pct:.1f}%",
+        f"- Total PRs: {agg.total}",
+        "",
+    ]
+
+    if len(team_aggs) > 1:
+        lines.append("**By team**")
+        for ta in team_aggs:
+            lines.append(
+                f"- {ta.team_slug}: {ta.agg.total} PRs, "
+                f"median TTA {fmt_hours(ta.agg.median_tta)}, "
+                f"SLA {ta.agg.sla_approval_pct:.0f}%"
+            )
+        lines.append("")
+
+    if seniority_stats:
+        lines.append("**Reviewer leadership by seniority**")
+        lines.append(
+            "_Measures whether senior reviewers are leading on review load and "
+            "speed — set `REVIEWER_SENIORITY` to populate tiers._"
+        )
+        for s in seniority_stats:
+            lines.append(
+                f"- {s.tier}: {s.reviewer_count} reviewer(s), {s.review_count} reviews "
+                f"({s.share_of_reviews_pct:.0f}% of all reviews), "
+                f"{s.share_of_first_approvals_pct:.0f}% of first approvals, "
+                f"median response {fmt_hours(s.median_response_bh)}"
+            )
+        lines.append("")
+
+    lines += [
+        "**What this means**",
+        "An awareness signal across teams: where review latency and reviewer "
+        "participation sit this month. It is not a verdict on any one team, "
+        "and the defect-escape figure above is a lower bound (GitHub-revert "
+        "based), not a complete quality measure — see the README.",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -854,7 +1412,7 @@ def run(
     now: datetime | None = None,
     backfill: date | None = None,
     dry_run: bool = False,
-    collector: Callable[[Config, datetime], list[PRRecord]] = collect_prs,
+    collector: Callable[[Config, datetime], CollectResult] = collect_prs,
 ) -> dict:
     """Execute one reporting cycle. Returns a small summary dict of what happened."""
     now = now or datetime.now(tz=cfg.tz)
@@ -871,19 +1429,28 @@ def run(
             else:
                 since = now - timedelta(days=cfg.backfill_days)
 
-        records = collector(cfg, since)
+        result = collector(cfg, since)
         collected_at = to_iso8601(now) or ""
-        for record in records:
+        for record in result.records:
             store.upsert_pr(record, collected_at)
+        # Group review events per PR before replacing — replace_reviews is
+        # per (repo, number) so a stale-review purge doesn't touch other PRs.
+        by_pr: dict[tuple[str, int], list[ReviewEvent]] = {}
+        for ev in result.review_events:
+            by_pr.setdefault((ev.repo, ev.number), []).append(ev)
+        for (repo, number), evs in by_pr.items():
+            store.replace_reviews(repo, number, evs)
         store.set_cursor(to_iso8601(now) or "")
-        actions["collected"] = len(records)
+        actions["collected"] = len(result.records)
 
         # Weekly digest.
         week_label = iso_week_label(now.astimezone(cfg.tz).date())
         if weekly_digest_due(now, store.was_sent("weekly", week_label)):
             w_start, w_end = week_window(now, cfg.tz)
-            agg = aggregate(store.fetch_between(w_start, w_end), cfg)
-            text = render_weekly_digest(agg, week_label, cfg)
+            week_records = store.fetch_between(w_start, w_end)
+            agg = aggregate(week_records, cfg)
+            team_aggs = aggregate_by_team(week_records, cfg)
+            text = render_weekly_digest(agg, week_label, cfg, team_aggs=team_aggs)
             if dry_run:
                 print("--- DRY RUN: weekly Slack digest ---")
                 print(text)
@@ -896,8 +1463,14 @@ def run(
         month_label = month_to_generate(now)
         if month_label and not store.was_sent("monthly", month_label):
             m_start, m_end = month_window(month_label, cfg.tz)
-            agg = aggregate(store.fetch_between(m_start, m_end), cfg)
-            text = render_monthly_summary(agg, month_label, cfg)
+            month_records = store.fetch_between(m_start, m_end)
+            agg = aggregate(month_records, cfg)
+            team_aggs = aggregate_by_team(month_records, cfg)
+            review_events = store.fetch_reviews_for(month_records)
+            seniority_stats = seniority_rollup(review_events, month_records, cfg)
+            text = render_monthly_summary(
+                agg, month_label, cfg, team_aggs=team_aggs, seniority_stats=seniority_stats
+            )
             if dry_run:
                 print("--- DRY RUN: monthly Markdown summary ---")
                 print(text)

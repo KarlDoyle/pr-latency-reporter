@@ -84,6 +84,90 @@ def test_sent_log():
     store.close()
 
 
+def test_replace_reviews_round_trip_and_idempotent():
+    store = plr.Store(":memory:")
+    events = [
+        plr.ReviewEvent(
+            repo="acme-corp/checkout",
+            number=1,
+            reviewer="alice",
+            state="APPROVED",
+            submitted_at="2026-01-06T11:00:00Z",
+            response_bh=2.0,
+        ),
+        plr.ReviewEvent(
+            repo="acme-corp/checkout",
+            number=1,
+            reviewer="bob",
+            state="COMMENTED",
+            submitted_at="2026-01-06T10:00:00Z",
+            response_bh=1.0,
+        ),
+    ]
+    store.replace_reviews("acme-corp/checkout", 1, events)
+    fetched = store.fetch_reviews_for([make_record(1, 1.0, 2.0)])
+    assert {e.reviewer for e in fetched} == {"alice", "bob"}
+
+    # Re-collecting the same PR with a dismissed review must replace, not
+    # accumulate — the stored set always reflects GitHub's current state.
+    store.replace_reviews("acme-corp/checkout", 1, events[:1])
+    fetched_again = store.fetch_reviews_for([make_record(1, 1.0, 2.0)])
+    assert {e.reviewer for e in fetched_again} == {"alice"}
+    store.close()
+
+
+def test_fetch_reviews_for_scopes_to_requested_prs():
+    store = plr.Store(":memory:")
+    store.replace_reviews(
+        "acme-corp/checkout",
+        1,
+        [
+            plr.ReviewEvent(
+                repo="acme-corp/checkout",
+                number=1,
+                reviewer="alice",
+                state="APPROVED",
+                submitted_at="2026-01-06T11:00:00Z",
+                response_bh=2.0,
+            )
+        ],
+    )
+    store.replace_reviews(
+        "acme-corp/checkout",
+        2,
+        [
+            plr.ReviewEvent(
+                repo="acme-corp/checkout",
+                number=2,
+                reviewer="bob",
+                state="APPROVED",
+                submitted_at="2026-01-06T11:00:00Z",
+                response_bh=2.0,
+            )
+        ],
+    )
+    fetched = store.fetch_reviews_for([make_record(1, 1.0, 2.0)])
+    assert {e.reviewer for e in fetched} == {"alice"}
+    store.close()
+
+
+def test_upsert_pr_persists_reviewer_attribution_and_team():
+    store = plr.Store(":memory:")
+    record = make_record(1, 1.0, 2.0)
+    record.team_slug = "checkout-team"
+    record.first_responder_login = "bob"
+    record.first_approver_login = "alice"
+    record.merge_commit_sha = "deadbeef"
+    store.upsert_pr(record, "2026-01-06T12:00:00Z")
+
+    fetched = store.fetch_all()[0]
+    assert fetched.team_slug == "checkout-team"
+    assert fetched.first_responder_login == "bob"
+    assert fetched.first_approver_login == "alice"
+    assert fetched.merge_commit_sha == "deadbeef"
+    store.close()
+
+
 def test_fetch_between_excludes_out_of_window():
     store = plr.Store(":memory:")
     store.upsert_pr(make_record(1, 1.0, 2.0, requested="2025-12-01T09:00:00Z"), "now")

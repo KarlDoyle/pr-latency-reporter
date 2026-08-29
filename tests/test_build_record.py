@@ -31,15 +31,51 @@ def test_latest_team_review_request(cfg):
 
 
 def test_summarise_reviews():
+    # Reviewer attribution fix: each review carries a distinct reviewer login,
+    # and summarise_reviews must return the correct login for the first
+    # response AND (separately) for the first approval, not just the login of
+    # whichever review happens to be first in the list.
     reviews = [
-        {"state": "COMMENTED", "submitted_at": "2026-01-05T09:30:00Z"},
-        {"state": "CHANGES_REQUESTED", "submitted_at": "2026-01-05T10:00:00Z"},
-        {"state": "APPROVED", "submitted_at": "2026-01-05T11:00:00Z"},
+        {
+            "user": {"login": "bob"},
+            "state": "COMMENTED",
+            "submitted_at": "2026-01-05T09:30:00Z",
+        },
+        {
+            "user": {"login": "carol"},
+            "state": "CHANGES_REQUESTED",
+            "submitted_at": "2026-01-05T10:00:00Z",
+        },
+        {
+            "user": {"login": "alice"},
+            "state": "APPROVED",
+            "submitted_at": "2026-01-05T11:00:00Z",
+        },
     ]
-    first_review, first_approval, changes = plr.summarise_reviews(reviews)
+    first_review, first_review_login, first_approval, first_approval_login, changes = (
+        plr.summarise_reviews(reviews)
+    )
     assert plr.to_iso8601(first_review) == "2026-01-05T09:30:00Z"
+    assert first_review_login == "bob"
     assert plr.to_iso8601(first_approval) == "2026-01-05T11:00:00Z"
+    assert first_approval_login == "alice"
     assert changes is True
+
+
+def test_summarise_reviews_distinguishes_reviewers_out_of_order():
+    # Approval arrives from a different, earlier-listed reviewer than the
+    # first response — must not conflate the two logins.
+    reviews = [
+        {"user": {"login": "dave"}, "state": "APPROVED", "submitted_at": "2026-01-05T09:00:00Z"},
+        {
+            "user": {"login": "erin"},
+            "state": "COMMENTED",
+            "submitted_at": "2026-01-05T08:00:00Z",
+        },
+    ]
+    _, first_review_login, _, first_approval_login, _ = plr.summarise_reviews(reviews)
+    assert first_review_login == "erin"
+    assert first_approval_login == "dave"
 
 
 def test_build_pr_record_computes_business_hours(cfg):
@@ -61,12 +97,16 @@ def test_build_pr_record_computes_business_hours(cfg):
         }
     ]
     reviews = [
-        {"state": "COMMENTED", "submitted_at": "2026-01-05T10:00:00Z"},
-        {"state": "APPROVED", "submitted_at": "2026-01-05T11:30:00Z"},
+        {"user": {"login": "bob"}, "state": "COMMENTED", "submitted_at": "2026-01-05T10:00:00Z"},
+        {
+            "user": {"login": "carol"},
+            "state": "APPROVED",
+            "submitted_at": "2026-01-05T11:30:00Z",
+        },
     ]
     comments = [{"created_at": "2026-01-05T10:30:00Z"}]
 
-    rec = plr.build_pr_record(item, events, reviews, comments, cfg)
+    rec = plr.build_pr_record(item, events, reviews, comments, cfg, merge_commit_sha="abc1234")
 
     assert rec.repo == "acme-corp/checkout"
     assert rec.number == 245
@@ -78,6 +118,13 @@ def test_build_pr_record_computes_business_hours(cfg):
     assert rec.sla_response_met == 1  # 1.0 <= 2.0
     assert rec.sla_approval_met == 1  # 2.5 <= 4.0
     assert rec.merged_at == "2026-01-05T14:00:00Z"
+    # Reviewer attribution: the PR *author* (alice) must never be confused
+    # with who actually reviewed it (bob responded first, carol approved).
+    assert rec.first_responder_login == "bob"
+    assert rec.first_approver_login == "carol"
+    assert rec.author != rec.first_responder_login
+    assert rec.team_slug == "your-team"
+    assert rec.merge_commit_sha == "abc1234"
 
 
 def test_build_pr_record_falls_back_to_created_at(cfg):
