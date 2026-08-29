@@ -1,10 +1,15 @@
-# PR Latency Reporter
+# PR Latency Reporter (`pr-latency-reporter`)
 
 Measure and report how fast pull requests get reviewed. The tool collects PR
 lifecycle events from the GitHub API, computes **business-hours-aware** review
 metrics, stores them append-only in SQLite, and emits a **weekly Slack digest**
 and a **monthly Markdown summary** — all from a single Python file with **zero
 third-party dependencies**.
+
+![tests](https://img.shields.io/badge/tests-42-slategray?style=flat-square)
+![deps](https://img.shields.io/badge/runtime--deps-zero-slategray?style=flat-square)
+![python](https://img.shields.io/badge/python-3.10%2B-slategray?style=flat-square)
+![licence](https://img.shields.io/badge/licence-UNLICENSED-slategray?style=flat-square)
 
 The default run takes **no arguments**: it detects the datastore, resumes from
 the last cursor, pulls only new/updated PRs, recomputes aggregates, and posts
@@ -119,6 +124,6 @@ SQLite round-trip, digest/summary rendering, scheduling, and a GitHub collect
 path driven by a **mocked `urlopen`**. A secret-scan test guards against
 committed tokens.
 
-## License
+## Licence
 
-Internal use only unless otherwise specified.
+Unlicensed (all rights reserved) — personal tooling, not published for reuse.
