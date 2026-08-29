@@ -1,0 +1,23 @@
+{
+  "name": "pr-latency-reporter",
+  "url": "https://REPLACE-WITH-YOUR-APP-HOMEPAGE",
+  "hook_attributes": {
+    "url": "https://REPLACE-WITH-YOUR-WEBHOOK-HOST/webhook",
+    "active": true
+  },
+  "redirect_url": "https://REPLACE-WITH-YOUR-APP-HOMEPAGE/setup/callback",
+  "callback_urls": ["https://REPLACE-WITH-YOUR-APP-HOMEPAGE/setup/callback"],
+  "public": false,
+  "default_permissions": {
+    "pull_requests": "read",
+    "issues": "read",
+    "contents": "read",
+    "members": "read",
+    "metadata": "read"
+  },
+  "default_events": [
+    "pull_request",
+    "pull_request_review",
+    "issue_comment"
+  ]
+}
