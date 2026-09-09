@@ -42,9 +42,35 @@ def test_weekly_digest_render(cfg):
     assert "Median Time to Approval: 3.7h" in text
     assert "SLA Compliance (<=4h approval): 82%" in text
     assert "P95 Latency: 7.5h" in text
-    assert "SLA Breaches: 1" in text
+    assert "Latency Outliers (>4h approval): 1" in text
     assert "acme-corp/checkout #245" in text
     assert "(12.0h)" in text
+
+
+def test_weekly_digest_render_multi_team(cfg):
+    checkout_agg = canned_aggregate()
+    mobile_agg = plr.Aggregate(
+        total=5,
+        median_ttfr=0.9,
+        median_tta=1.7,
+        sla_response_pct=100.0,
+        sla_approval_pct=100.0,
+        p95_tta=2.5,
+        rework_pct=0.0,
+        defect_pct=0.0,
+        breaches=[],
+    )
+    team_aggs = [
+        plr.TeamAggregate(team_slug="checkout-team", agg=checkout_agg),
+        plr.TeamAggregate(team_slug="mobile-team", agg=mobile_agg),
+    ]
+    text = plr.render_weekly_digest(checkout_agg, "2026-W03", cfg, team_aggs=team_aggs)
+    assert "2 teams" in text
+    assert "By team (awareness, not a ranking)" in text
+    assert "checkout-team" in text
+    assert "mobile-team" in text
+    # Multi-team framing, not a single-team performance verdict.
+    assert "worst" not in text.lower()
 
 
 def test_monthly_summary_render(cfg):
@@ -53,7 +79,37 @@ def test_monthly_summary_render(cfg):
     assert "Median Time to Approval (TTA): 3.7h" in text
     assert "SLA Compliance (<=4h): 82%" in text
     assert "P95 TTA: 7.5h" in text
-    assert "Defect Escape Rate: 0.6%" in text
+    # Defect-escape is now a real (revert-based, lower-bound) signal, honestly
+    # labelled as such rather than presented as a complete measure.
+    assert "Defect Escape Rate (revert-based, lower bound): 0.6%" in text
+    assert "not a single-team performance verdict" in text
+
+
+def test_monthly_summary_render_seniority_section(cfg):
+    seniority_stats = [
+        plr.SeniorityStat(
+            tier="senior",
+            reviewer_count=2,
+            review_count=8,
+            median_response_bh=1.2,
+            share_of_reviews_pct=80.0,
+            share_of_first_approvals_pct=75.0,
+        ),
+        plr.SeniorityStat(
+            tier="unspecified",
+            reviewer_count=1,
+            review_count=2,
+            median_response_bh=3.0,
+            share_of_reviews_pct=20.0,
+            share_of_first_approvals_pct=25.0,
+        ),
+    ]
+    text = plr.render_monthly_summary(
+        canned_aggregate(), "2026-01", cfg, seniority_stats=seniority_stats
+    )
+    assert "Reviewer leadership by seniority" in text
+    assert "senior: 2 reviewer(s), 8 reviews" in text
+    assert "75% of first approvals" in text
 
 
 def test_weekly_digest_due_friday_afternoon():

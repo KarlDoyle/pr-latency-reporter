@@ -1,0 +1,40 @@
+modules:
+  jira:globalPage:
+    - key: pr-latency-dashboard
+      resource: dashboard
+      resolver:
+        function: resolver
+      title: PR Review Latency (Multi-Team)
+      icon: resource:dashboard;icon.svg
+
+function:
+  - key: resolver
+    handler: index.handler
+
+resources:
+  - key: dashboard
+    path: static/dashboard/build
+
+app:
+  id: "REPLACE_WITH_YOUR_FORGE_APP_ID" # from `forge register`, see README
+
+permissions:
+  scopes:
+    - read:jira-work
+  external:
+    fetch:
+      backend:
+        # Replace with the public HTTPS host of marketplace/api_server.py.
+        # Forge egress is allow-listed per manifest entry — nothing else can
+        # be reached from the resolver.
+        - "REPLACE-WITH-YOUR-API-HOST.example.com"
+
+environments:
+  default:
+    variables:
+      - key: PR_LATENCY_API_BASE_URL
+        # e.g. https://REPLACE-WITH-YOUR-API-HOST.example.com
+      - key: PR_LATENCY_API_TOKEN
+        # the same value as API_AUTH_TOKEN on marketplace/api_server.py — set
+        # via `forge variables set --encrypt PR_LATENCY_API_TOKEN <value>`,
+        # never committed here.

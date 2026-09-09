@@ -4,13 +4,18 @@ The canonical agent instructions for this repo (`CLAUDE.md` defers here).
 
 ## What this is
 
-A single-file Python CLI that measures how fast pull requests get reviewed.
-It pulls PR review-lifecycle events from the GitHub API, computes
-**business-hours-aware** latency metrics (TTFR, TTA, SLA %, P95, rework rate,
-defect-escape rate), stores them append-only in SQLite, and emits a **weekly
-Slack digest** (Fridays) plus a **monthly Markdown summary**. It is not a
-GitHub Action — there is no `action.yml`; it runs as a plain script on a cron
-(hourly, `5 * * * *`) or invoked ad hoc.
+A single-file Python CLI that measures how fast pull requests get reviewed,
+across one or more teams. It pulls PR review-lifecycle events from the
+GitHub API, computes **business-hours-aware** latency metrics (TTFR, TTA,
+SLA %, P95, rework rate, a real revert-based defect-escape rate, and
+per-reviewer-seniority rollups), stores them append-only in SQLite, and
+emits a **weekly Slack digest** (Fridays) plus a **monthly Markdown
+summary**, framed as director/TPM-level multi-team awareness rather than a
+single-team performance verdict. It is not a GitHub Action — there is no
+`action.yml`; it runs as a plain script on a cron (hourly, `5 * * * *`) or
+invoked ad hoc. `marketplace/` scaffolds a GitHub App and an Atlassian Forge
+app on top of the same core (see `marketplace/README.md`); it has its own,
+separate test suite and does not change the core tool's contract.
 
 ## Stack
 
@@ -26,8 +31,12 @@ tooling, not published for reuse; do not add a licence.
 uv sync --dev                 # install (or: python3 -m venv .venv && pip install ruff pytest)
 uv run ruff check .           # lint
 uv run ruff format --check .  # format check (does not rewrite files)
-uv run pytest                 # test — 42 tests, no network, no tokens
+uv run pytest                 # test — 66 tests, no network, no tokens
 ```
+
+`marketplace/` (GitHub App + Forge app scaffolds) has its own test suite,
+run separately and not part of the gate above:
+`uv run pytest marketplace/github-app/tests/ marketplace/tests/ -q`.
 
 Run the tool itself:
 
@@ -41,33 +50,62 @@ python3 pr_latency_reporter.py --dry-run           # print instead of posting/wr
 
 Everything lives in one file, `pr_latency_reporter.py`, organised into clearly
 banner-commented sections (in order): Configuration → Config object →
-datetime helpers → business-hours maths → metric primitives → `PRRecord` +
-`build_pr_record` → `Aggregate`/`aggregate` → `Store` (SQLite) → GitHub/Slack
-HTTP → rendering (digest/summary) → scheduling → `run()` orchestration → CLI
-(`argparse`, `main`).
+datetime helpers → business-hours maths → metric primitives (incl. the
+defect-escape SHA matching) → `PRRecord`/`ReviewEvent` + `build_pr_record`/
+`build_review_events` → `Aggregate`/`aggregate` + multi-team/seniority
+rollups → `Store` (SQLite) → GitHub/Slack HTTP → rendering (digest/summary)
+→ scheduling → `run()` orchestration → CLI (`argparse`, `main`).
 
-- **Latency computation** — `business_hours_between()` (line ~170) walks
+- **Latency computation** — `business_hours_between()` (line ~230) walks
   day-by-day between two aware datetimes, intersecting each day's
   09:00–17:00 (configurable) window in the configured timezone, skipping
   weekends and `HOLIDAYS_YYYYMMDD`. All metrics (`percentile`,
   `sla_compliance_pct`, etc.) are pure functions over lists of floats/bools —
   no I/O, fully unit-testable.
+- **Reviewer attribution** — `summarise_reviews()` and `earliest_comment()`
+  return the reviewer/commenter login alongside the timestamp;
+  `build_pr_record()` uses this for `PRRecord.first_responder_login` /
+  `first_approver_login`. `build_review_events()` produces one `ReviewEvent`
+  per review (every review, not just the first), which is what
+  `reviewer_aggregate()` and `seniority_rollup()` (fed by the
+  `REVIEWER_SENIORITY` login→tier map) turn into the "are seniors leading"
+  numbers.
+- **Defect-escape signal** — `extract_reverted_sha()` /
+  `defect_escape_shas()` / `apply_defect_flags()`: parses GitHub's own
+  `This reverts commit <sha>.` marker out of "Revert" PR bodies and matches
+  it against a collected PR's `merge_commit_sha`. A real, explicitly
+  lower-bound signal — see the README's "Fixes" section before touching
+  this; do not silently widen its claimed coverage in copy.
+- **Multi-team** — `Config.teams` (from `TEAM_SLUGS`, falling back to
+  `TEAM_SLUG`); `search_review_requested()` issues one query per team and
+  de-dupes; `latest_team_review_request_multi()` picks whichever configured
+  team's request is latest and tags `PRRecord.team_slug`;
+  `aggregate_by_team()` groups for the per-team breakdown ("unassigned"
+  bucket for PRs with no matched team — never silently dropped).
 - **CLI entrypoint** — `main()` / `build_arg_parser()` at the bottom of the
   file: `--backfill YYYY-MM-DD` and `--dry-run` are the only flags; the
   default (no args) resumes from the SQLite cursor.
 - **GitHub API usage** — `http_json()` wraps `urllib.request` (Bearer token
   auth, never logs the token; HTTP errors are re-raised with the token
   stripped from the message). `search_review_requested()` paginates the
-  Search API for `team-review-requested:<org>/<team>`; `fetch_pr_detail()`
-  pulls per-PR issue events, reviews, and comments; `collect_prs()` ties
-  these together into `PRRecord`s via `build_pr_record()`.
-- **Storage** — `Store` (SQLite): `pr_events` (append-only log),
-  `prs` (current-state upsert by repo+number), `meta` (resume cursor),
-  `sent_log` (digest/summary idempotency — never double-posts).
+  Search API for `team-review-requested:<org>/<team>` per team;
+  `search_revert_prs()` finds revert PRs for the defect signal;
+  `fetch_pr_detail()` pulls per-PR issue events, reviews, comments, and the
+  `/pulls/{number}` detail (for `merge_commit_sha`); `collect_prs()` ties
+  these together into a `CollectResult` (`records` + `review_events`) via
+  `build_pr_record()` / `build_review_events()` / `apply_defect_flags()`.
+- **Storage** — `Store` (SQLite): `pr_events` (append-only log), `prs`
+  (current-state upsert by repo+number, incl. `team_slug`,
+  `first_responder_login`, `first_approver_login`, `merge_commit_sha`),
+  `pr_reviews` (one row per review, replaced — not upserted — per PR on
+  each re-collection so a dismissed review doesn't linger), `meta` (resume
+  cursor), `sent_log` (digest/summary idempotency — never double-posts).
 - **Output** — `render_weekly_digest()` / `render_monthly_summary()` build the
-  Slack text / Markdown file; `post_slack()` posts via `chat.postMessage`.
-  Weekly digest posts Fridays from 16:00 local (or on weekend catch-up);
-  monthly summary writes to `data/summaries/YYYY-MM.md`.
+  Slack text / Markdown file (both take optional `team_aggs`/
+  `seniority_stats` for the multi-team and reviewer-leadership sections);
+  `post_slack()` posts via `chat.postMessage`. Weekly digest posts Fridays
+  from 16:00 local (or on weekend catch-up); monthly summary writes to
+  `data/summaries/YYYY-MM.md`.
 
 ## Conventions
 
@@ -98,7 +136,7 @@ uv run ruff check . && uv run ruff format --check . && uv run pytest
   patterns, AWS keys, private-key headers) **and** for employer-specific
   placeholder strings that must never be reintroduced. A failing secret-scan
   test blocks the merge — do not weaken or delete it to make a change pass.
-- No coverage gate is currently configured; keep the 42/42 pass rate and add
+- No coverage gate is currently configured; keep the 66/66 pass rate and add
   a test for any new pure function or metric.
 
 ## Rules
@@ -112,5 +150,5 @@ uv run ruff check . && uv run ruff format --check . && uv run pytest
   placeholder check.
 - Keep the file dependency-free at runtime; keep tests network-free and
   token-free (mock `urlopen`, never call the real GitHub/Slack API in a test).
-- Keep all 42 tests green before proposing a change; add tests alongside any
+- Keep all 66 tests green before proposing a change; add tests alongside any
   new metric or code path rather than after.
