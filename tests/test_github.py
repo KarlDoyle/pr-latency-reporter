@@ -144,8 +144,10 @@ def test_collect_prs_flags_defect_from_revert_pr(monkeypatch, cfg):
         "total_count": 1,
         "items": [
             {
+                "repository_url": "https://api.github.com/repos/acme-corp/checkout",
                 "title": 'Revert "Ship risky change"',
                 "body": "This reverts commit cafebabe1234deadbeef.\n",
+                "created_at": "2026-01-07T09:00:00Z",
             }
         ],
     }

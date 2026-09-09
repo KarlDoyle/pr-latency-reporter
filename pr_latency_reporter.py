@@ -340,29 +340,70 @@ def extract_reverted_sha(body: str | None) -> str | None:
     return m.group(1)[:7] if m else None
 
 
-def defect_escape_shas(revert_items: Iterable[dict]) -> set[str]:
-    """Short (7-char) SHAs reverted by any PR in ``revert_items``.
+def defect_escape_shas(revert_items: Iterable[dict]) -> dict[str, dict[str, datetime]]:
+    """Map each repo to ``{reverted_short_sha: revert_pr_timestamp}``.
 
-    ``revert_items`` are GitHub search-API PR items (must include ``body``).
-    Matching against ``PRRecord.merge_commit_sha[:7]`` is how ``defect_flag``
-    gets set — see ``search_revert_prs`` / ``apply_defect_flags``.
+    ``revert_items`` are GitHub search-API PR items (must include ``body``
+    and ``repository_url``). Repo-scoped — two PRs in different repos that
+    happen to share a 7-char merge-commit-SHA prefix must never collide; see
+    ``apply_defect_flags``, which is what previously matched
+    ``PRRecord.merge_commit_sha[:7]`` against a single org-wide set (bug: a
+    cross-repo false positive). The recorded timestamp is when the revert PR
+    itself landed (merged, else closed, else created) — used by
+    ``apply_defect_flags`` to bound matching to ``defect_lookback_days`` of
+    the original merge.
     """
-    shas: set[str] = set()
+    out: dict[str, dict[str, datetime]] = {}
     for item in revert_items:
         sha = extract_reverted_sha(item.get("body"))
-        if sha:
-            shas.add(sha)
-    return shas
+        if not sha:
+            continue
+        repo = repo_full_name_from_url(item.get("repository_url", ""))
+        when = (
+            parse_iso8601((item.get("pull_request") or {}).get("merged_at"))
+            or parse_iso8601(item.get("closed_at"))
+            or parse_iso8601(item.get("created_at"))
+        )
+        if when is None:
+            continue
+        bucket = out.setdefault(repo, {})
+        if sha not in bucket or when < bucket[sha]:
+            bucket[sha] = when
+    return out
 
 
-def apply_defect_flags(records: Sequence[PRRecord], reverted_shas: set[str]) -> None:
+def apply_defect_flags(
+    records: Sequence[PRRecord],
+    reverted_shas_by_repo: dict[str, dict[str, datetime]],
+    defect_lookback_days: int,
+) -> None:
     """Set ``defect_flag`` in place for any merged record whose
-    ``merge_commit_sha`` (short form) was reverted. Pure w.r.t. its inputs
-    other than mutating the records it's handed — mirrors how ``collect_prs``
-    already builds records before storing them.
+    ``merge_commit_sha`` (short form) was reverted **in the same repo**,
+    **within ``defect_lookback_days`` of the record's own ``merged_at``**.
+
+    Repo-scoped: only ``reverted_shas_by_repo[record.repo]`` is consulted, so
+    a short-SHA collision between unrelated PRs in different repos can never
+    set the flag. Lookback-bounded: a revert landing more than
+    ``defect_lookback_days`` after the original merge is not counted — a
+    revert matched years later isn't "the same defect escaping". Records
+    with no ``merge_commit_sha`` or no ``merged_at`` are never flagged. Pure
+    w.r.t. its inputs other than mutating the records it's handed — mirrors
+    how ``collect_prs`` already builds records before storing them.
     """
     for record in records:
-        if record.merge_commit_sha and record.merge_commit_sha[:7] in reverted_shas:
+        if not record.merge_commit_sha or not record.merged_at:
+            continue
+        bucket = reverted_shas_by_repo.get(record.repo)
+        if not bucket:
+            continue
+        revert_when = bucket.get(record.merge_commit_sha[:7])
+        if revert_when is None:
+            continue
+        merged_when = parse_iso8601(record.merged_at)
+        if merged_when is None:
+            continue
+        delta_days = (revert_when - merged_when).total_seconds() / 86400.0
+        if 0 <= delta_days <= defect_lookback_days:
             record.defect_flag = 1
 
 
@@ -492,6 +533,7 @@ def latest_team_review_request_multi(
 
 def summarise_reviews(
     reviews: Iterable[dict],
+    author: str = "",
 ) -> tuple[datetime | None, str, datetime | None, str, bool]:
     """Return (first_review_at, first_review_login, first_approval_at,
     first_approval_login, any_changes_requested).
@@ -499,6 +541,12 @@ def summarise_reviews(
     Captures ``review.user.login`` for both the first response and the first
     approval — this is the reviewer-attribution fix. Previously this function
     (and the record it fed) never read the login at all.
+
+    ``author``, if given, excludes any review authored by the PR's own
+    author from all of the above — a self-review (e.g. a self-approval)
+    must never become ``first_response_at``/``first_approval_at``, which
+    would artificially drive TTFR/TTA toward zero and inflate SLA%, and
+    would pollute any seniority-tiered first-approvals rollup.
     """
     first_review: datetime | None = None
     first_review_login = ""
@@ -510,6 +558,8 @@ def summarise_reviews(
         if when is None:
             continue
         login = (review.get("user") or {}).get("login", "")
+        if author and login == author:
+            continue  # self-review: never counts as external review activity
         if first_review is None or when < first_review:
             first_review = when
             first_review_login = login
@@ -586,6 +636,7 @@ def build_pr_record(
 ) -> PRRecord:
     """Combine raw GitHub payloads into a metric-bearing PRRecord. Pure."""
     repo = repo_full_name_from_url(item.get("repository_url", ""))
+    author = (item.get("user") or {}).get("login", "")
     review_requested_at, matched_team = latest_team_review_request_multi(events, cfg.teams)
     (
         first_review_at,
@@ -593,7 +644,7 @@ def build_pr_record(
         first_approval_at,
         first_approval_login,
         changes_requested,
-    ) = summarise_reviews(reviews)
+    ) = summarise_reviews(reviews, author=author)
     comment_at, comment_login = earliest_comment(comments)
 
     # First response = earliest of first review (any state) and first comment.
@@ -634,7 +685,7 @@ def build_pr_record(
         repo=repo,
         number=int(item["number"]),
         title=item.get("title", ""),
-        author=(item.get("user") or {}).get("login", ""),
+        author=author,
         html_url=item.get("html_url", ""),
         created_at=to_iso8601(parse_iso8601(item.get("created_at"))),
         review_requested_at=to_iso8601(review_requested_at),
@@ -719,8 +770,15 @@ def aggregate_by_team(records: Sequence[PRRecord], cfg: Config) -> list[TeamAggr
     under ``"unassigned"`` rather than dropped, so nothing is silently
     excluded from the multi-team view. Sorted by team slug for a stable,
     non-editorialising order (not ranked "best"/"worst").
+
+    Every team in ``cfg.teams`` is seeded with an empty bucket up front, so
+    a configured team with zero matching records (a slug typo, or a team
+    with genuinely no activity that period) still appears in the output as
+    an explicit zero-PR row rather than silently vanishing — which would
+    otherwise also make ``render_weekly_digest``'s by-team section disappear
+    entirely whenever only one of several configured teams had data.
     """
-    by_team: dict[str, list[PRRecord]] = {}
+    by_team: dict[str, list[PRRecord]] = {team: [] for team in cfg.teams}
     for r in records:
         key = r.team_slug or "unassigned"
         by_team.setdefault(key, []).append(r)
@@ -1195,8 +1253,8 @@ def collect_prs(cfg: Config, since: datetime) -> CollectResult:
         anchor = parse_iso8601(record.review_requested_at) or parse_iso8601(record.created_at)
         review_events.extend(build_review_events(repo, number, reviews, anchor, cfg))
 
-    reverted_shas = defect_escape_shas(search_revert_prs(cfg, since))
-    apply_defect_flags(records, reverted_shas)
+    reverted_shas_by_repo = defect_escape_shas(search_revert_prs(cfg, since))
+    apply_defect_flags(records, reverted_shas_by_repo, cfg.defect_lookback_days)
 
     return CollectResult(records=records, review_events=review_events)
 

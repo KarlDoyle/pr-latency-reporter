@@ -76,12 +76,25 @@ def test_extract_reverted_sha_no_match():
 
 def test_defect_escape_shas_collects_all_matches():
     revert_items = [
-        {"body": "This reverts commit aaaa1112222.\n"},
-        {"body": "no marker here"},
-        {"body": "This reverts commit bbbb2223333.\n"},
+        {
+            "repository_url": "https://api.github.com/repos/acme-corp/checkout",
+            "body": "This reverts commit aaaa1112222.\n",
+            "created_at": "2026-01-06T09:00:00Z",
+        },
+        {
+            "repository_url": "https://api.github.com/repos/acme-corp/checkout",
+            "body": "no marker here",
+            "created_at": "2026-01-06T09:00:00Z",
+        },
+        {
+            "repository_url": "https://api.github.com/repos/acme-corp/mobile",
+            "body": "This reverts commit bbbb2223333.\n",
+            "created_at": "2026-01-06T09:00:00Z",
+        },
     ]
     shas = plr.defect_escape_shas(revert_items)
-    assert shas == {"aaaa111", "bbbb222"}
+    assert set(shas["acme-corp/checkout"]) == {"aaaa111"}
+    assert set(shas["acme-corp/mobile"]) == {"bbbb222"}
 
 
 def test_apply_defect_flags_sets_flag_on_matching_merge_commit_sha(cfg):
@@ -111,7 +124,10 @@ def test_apply_defect_flags_sets_flag_on_matching_merge_commit_sha(cfg):
         merged_at="2026-01-05T12:00:00Z",
         merge_commit_sha="ffffffff9999",
     )
-    plr.apply_defect_flags([matched, unmatched], {"deadbee"})
+    reverted_by_repo = {
+        "acme-corp/checkout": {"deadbee": plr.parse_iso8601("2026-01-06T12:00:00Z")},
+    }
+    plr.apply_defect_flags([matched, unmatched], reverted_by_repo, 14)
     assert matched.defect_flag == 1
     assert unmatched.defect_flag == 0
 
@@ -130,8 +146,146 @@ def test_apply_defect_flags_no_op_when_no_sha():
         merged_at="2026-01-05T12:00:00Z",
         merge_commit_sha="",
     )
-    plr.apply_defect_flags([record], {"deadbee"})
+    reverted_by_repo = {
+        "acme-corp/checkout": {"deadbee": plr.parse_iso8601("2026-01-06T12:00:00Z")},
+    }
+    plr.apply_defect_flags([record], reverted_by_repo, 14)
     assert record.defect_flag == 0
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 regression — cross-repo defect false-positive.
+#
+# Before the fix, defect_escape_shas() returned one org-wide set of reverted
+# short SHAs and apply_defect_flags() matched every record against it with
+# no repo scoping at all. Two PRs in unrelated repos that happen to share a
+# 7-char merge-commit-SHA prefix would collide, and the WRONG repo's PR got
+# defect_flag=1 for a revert that has nothing to do with it.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_defect_flags_does_not_cross_repo_collide():
+    # Same short SHA prefix, two different repos. Only "mobile" was actually
+    # reverted (per reverted_by_repo); "checkout" sharing the prefix must NOT
+    # be flagged.
+    checkout_pr = plr.PRRecord(
+        repo="acme-corp/checkout",
+        number=1,
+        title="t",
+        author="a",
+        html_url="https://example.test/1",
+        created_at=None,
+        review_requested_at=None,
+        first_response_at=None,
+        first_approval_at=None,
+        merged_at="2026-01-05T12:00:00Z",
+        merge_commit_sha="cafebabe000000",
+    )
+    mobile_pr = plr.PRRecord(
+        repo="acme-corp/mobile",
+        number=2,
+        title="t2",
+        author="a",
+        html_url="https://example.test/2",
+        created_at=None,
+        review_requested_at=None,
+        first_response_at=None,
+        first_approval_at=None,
+        merged_at="2026-01-05T12:00:00Z",
+        merge_commit_sha="cafebabe999999",  # same 7-char prefix as checkout_pr
+    )
+    reverted_by_repo = {
+        "acme-corp/mobile": {"cafebab": plr.parse_iso8601("2026-01-06T09:00:00Z")},
+    }
+    plr.apply_defect_flags([checkout_pr, mobile_pr], reverted_by_repo, 14)
+    assert mobile_pr.defect_flag == 1  # the actual revert
+    assert checkout_pr.defect_flag == 0  # must NOT collide across repos
+
+
+def test_defect_escape_shas_scopes_by_repo_end_to_end():
+    """End-to-end: two revert PRs in different repos referencing SHAs that
+    share a 7-char prefix must never cross-match the other repo's record."""
+    revert_items = [
+        {
+            "repository_url": "https://api.github.com/repos/acme-corp/checkout",
+            "body": "This reverts commit cafebabe000000deadbeef.\n",
+            "created_at": "2026-01-06T09:00:00Z",
+        },
+    ]
+    shas_by_repo = plr.defect_escape_shas(revert_items)
+    other_repo_record = plr.PRRecord(
+        repo="acme-corp/mobile",
+        number=9,
+        title="t",
+        author="a",
+        html_url="https://example.test/9",
+        created_at=None,
+        review_requested_at=None,
+        first_response_at=None,
+        first_approval_at=None,
+        merged_at="2026-01-05T12:00:00Z",
+        merge_commit_sha="cafebabe999999",  # same 7-char prefix, different repo
+    )
+    plr.apply_defect_flags([other_repo_record], shas_by_repo, 14)
+    assert other_repo_record.defect_flag == 0
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 regression — defect_lookback_days was dead code.
+#
+# DEFECT_LOOKBACK_DAYS / Config.defect_lookback_days was defined and
+# documented in defect_escape_pct's docstring ("within defect_lookback_days
+# of the original merge") but never actually consulted anywhere in the
+# matching path — a revert matched any amount of time later still set
+# defect_flag=1. Now apply_defect_flags() bounds the match window for real.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_defect_flags_respects_lookback_window():
+    record = plr.PRRecord(
+        repo="acme-corp/checkout",
+        number=1,
+        title="t",
+        author="a",
+        html_url="https://example.test/1",
+        created_at=None,
+        review_requested_at=None,
+        first_response_at=None,
+        first_approval_at=None,
+        merged_at="2026-01-01T12:00:00Z",
+        merge_commit_sha="deadbeef123456",
+    )
+    # Revert landed 400 days after the original merge — well outside any
+    # sane lookback window, so this must NOT count as the same defect
+    # escaping.
+    reverted_by_repo = {
+        "acme-corp/checkout": {"deadbee": plr.parse_iso8601("2027-02-05T12:00:00Z")},
+    }
+    plr.apply_defect_flags([record], reverted_by_repo, 14)
+    assert record.defect_flag == 0
+
+
+def test_apply_defect_flags_within_lookback_window_still_flags():
+    record = plr.PRRecord(
+        repo="acme-corp/checkout",
+        number=1,
+        title="t",
+        author="a",
+        html_url="https://example.test/1",
+        created_at=None,
+        review_requested_at=None,
+        first_response_at=None,
+        first_approval_at=None,
+        merged_at="2026-01-01T12:00:00Z",
+        merge_commit_sha="deadbeef123456",
+    )
+    # Revert landed 5 days after the original merge — within the 14-day
+    # lookback, so this must still count.
+    reverted_by_repo = {
+        "acme-corp/checkout": {"deadbee": plr.parse_iso8601("2026-01-06T12:00:00Z")},
+    }
+    plr.apply_defect_flags([record], reverted_by_repo, 14)
+    assert record.defect_flag == 1
 
 
 def test_aggregate_end_to_end(cfg):

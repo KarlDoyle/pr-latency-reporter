@@ -155,7 +155,8 @@ def test_seniority_rollup_empty_is_zero_not_error(cfg):
 # ---------------------------------------------------------------------------
 
 
-def test_aggregate_by_team_groups_correctly(cfg):
+def test_aggregate_by_team_groups_correctly():
+    cfg = plr.Config(gh_org="acme-corp", team_slugs=("checkout-team", "mobile-team"))
     records = [
         make_pr(1, "checkout-team", "alice"),
         make_pr(2, "checkout-team", "bob"),
@@ -175,6 +176,40 @@ def test_aggregate_by_team_buckets_unmatched_team_as_unassigned(cfg):
     by_team = plr.aggregate_by_team(records, cfg)
     assert by_team[0].team_slug == "unassigned"
     assert by_team[0].agg.total == 1  # nothing silently dropped
+
+
+# ---------------------------------------------------------------------------
+# Bug 4 regression — silent team disappearance.
+#
+# Before the fix, aggregate_by_team() only emitted teams that had matching
+# records: a configured team with zero matches (slug typo, or genuinely no
+# activity that period) just vanished with no trace. That also made
+# render_weekly_digest's by-team section (len(team_aggs) > 1) silently
+# disappear whenever only one of several configured teams had data, so a
+# 2-team deployment with a typo'd second slug looked like clean, honest
+# single-team output.
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_by_team_includes_configured_team_with_zero_matches():
+    cfg = plr.Config(gh_org="acme-corp", team_slugs=("checkout-team", "mobile-team"))
+    records = [make_pr(1, "checkout-team", "alice")]  # mobile-team: e.g. a slug typo
+    by_team = plr.aggregate_by_team(records, cfg)
+    totals = {t.team_slug: t.agg.total for t in by_team}
+    assert totals == {"checkout-team": 1, "mobile-team": 0}  # visible, not vanished
+
+
+def test_render_weekly_digest_reveals_configured_team_with_no_data():
+    """End-to-end: a configured-but-empty second team must still show up in
+    the rendered digest's by-team section, not silently disappear."""
+    cfg = plr.Config(gh_org="acme-corp", team_slugs=("checkout-team", "mobile-team"))
+    records = [make_pr(1, "checkout-team", "alice")]
+    agg = plr.aggregate(records, cfg)
+    team_aggs = plr.aggregate_by_team(records, cfg)
+    text = plr.render_weekly_digest(agg, "2026-W03", cfg, team_aggs=team_aggs)
+    assert "By team" in text  # section renders even though only 1 of 2 has data
+    assert "mobile-team: 0 PRs" in text
+    assert "checkout-team: 1 PRs" in text
 
 
 # ---------------------------------------------------------------------------
