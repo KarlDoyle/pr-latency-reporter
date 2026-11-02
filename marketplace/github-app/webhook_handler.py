@@ -29,6 +29,7 @@ import http.server
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -36,6 +37,37 @@ import pr_latency_reporter as plr  # noqa: E402
 
 WEBHOOK_SECRET = os.getenv("GH_WEBHOOK_SECRET", "")
 RELEVANT_EVENTS = {"pull_request", "pull_request_review", "issue_comment"}
+MAX_REQUEST_BYTES = 1024 * 1024
+REQUEST_TIMEOUT_SECONDS = 10
+
+
+def read_bounded_body(content_length: str | None, stream, connection=None) -> bytes | None:
+    """Read a complete request body only when its declared size is bounded."""
+    try:
+        length = int(content_length or "")
+    except ValueError:
+        return None
+    if length <= 0 or length > MAX_REQUEST_BYTES:
+        return None
+    deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+    chunks = []
+    remaining = length
+    try:
+        while remaining:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                return None
+            if connection is not None:
+                connection.settimeout(timeout)
+            read = getattr(stream, "read1", None) or stream.read
+            chunk = read(min(64 * 1024, remaining))
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except (TimeoutError, OSError):
+        return None
+    return b"".join(chunks)
 
 
 def verify_signature(secret: str, payload: bytes, signature_header: str | None) -> bool:
@@ -125,13 +157,22 @@ def handle_event(cfg: plr.Config, event_type: str, body: dict) -> str | None:
 class WebhookHandler(http.server.BaseHTTPRequestHandler):
     cfg: plr.Config = None  # set by main() before serve_forever
 
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(REQUEST_TIMEOUT_SECONDS)
+
     def do_POST(self) -> None:  # noqa: N802 (stdlib naming convention)
         if self.path.rstrip("/") != "/webhook":
             self.send_response(404)
             self.end_headers()
             return
-        length = int(self.headers.get("Content-Length", "0"))
-        body_bytes = self.rfile.read(length)
+        body_bytes = read_bounded_body(
+            self.headers.get("Content-Length"), self.rfile, self.connection
+        )
+        if body_bytes is None:
+            self.send_response(413)
+            self.end_headers()
+            return
         signature = self.headers.get("X-Hub-Signature-256")
         if not verify_signature(WEBHOOK_SECRET, body_bytes, signature):
             self.send_response(401)
