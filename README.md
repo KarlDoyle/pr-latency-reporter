@@ -60,14 +60,9 @@ uv sync --locked --dev
 uv run ruff check .
 uv run ruff format --check .
 uv run pytest
-uv run pytest marketplace/github-app/tests/ marketplace/tests/ -q
 ```
 
 CI runs these checks on Python 3.11 and 3.14. Tests use mocks and do not contact GitHub or Slack.
-
-## Optional marketplace scaffolds
-
-The `marketplace/` directory contains experimental GitHub App and Atlassian Forge scaffolds. They are not needed to use the local CLI and are not registered, hosted, or part of this tool's supported download workflow.
 
 ## License
 
