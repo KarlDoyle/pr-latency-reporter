@@ -6,15 +6,14 @@ A small, self-hosted Python tool that collects pull request review activity from
 
 ## Quick start
 
-Requirements: Python 3.11 or newer and a GitHub token with access to the repositories and organization teams you want to measure.
+Requirements: Python 3.11 or newer and a GitHub token that can read the repositories and team review requests you want to measure. The tool does not need write access.
 
 ```bash
 git clone https://github.com/KarlDoyle/pr-latency-reporter.git
 cd pr-latency-reporter
 ```
 
-You can also download and unzip the repository from GitHub. The tool has no
-runtime packages; the development tools are only needed to run its checks.
+Or choose **Code → Download ZIP**, unzip it, and run the commands from the extracted `pr-latency-reporter-main` directory. The tool has no runtime packages; development tools are only needed to run its checks.
 
 Set the required GitHub configuration, then run the script:
 
@@ -31,9 +30,10 @@ The first run collects the previous 28 days. Later runs resume from a local curs
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `GH_TOKEN` | Yes | — | GitHub token; use the narrowest access suitable for your repositories and teams. |
+| `GH_TOKEN` | Yes | — | Use the narrowest read-only access available for the repositories and team review data you need. See [GitHub's fine-grained token permissions](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens). |
 | `GH_ORG` | Yes | — | GitHub organization. |
 | `TEAM_SLUG` or `TEAM_SLUGS` | Yes | — | One team slug, or a comma-separated list. |
+| `GH_API` | No | `https://api.github.com` | GitHub REST API base URL, if using GitHub Enterprise Server. |
 | `DATA_DIR` | No | `data` | Local database and report directory. |
 | `TZ_NAME` | No | `Europe/London` | Time zone used for business hours and report scheduling. |
 | `SLACK_BOT_TOKEN` | Only with `--post-slack` | — | Slack bot token. |
@@ -49,7 +49,7 @@ Additional settings for business hours, holidays, SLAs, reviewer tiers, and the 
 - `python3 pr_latency_reporter.py --post-slack` also sends the weekly report to Slack. Monthly summaries stay local.
 - `python3 pr_latency_reporter.py --backfill YYYY-MM-DD` sets a one-time collection start date.
 
-Latencies use configured business hours (weekdays, 09:00–17:00 by default). The revert-based defect metric only detects GitHub Revert PRs and is a lower-bound signal. Metrics describe observed review activity; they are not a complete measure of quality or individual performance. Treat reports as potentially sensitive because they contain repository and reviewer information.
+Latencies use configured business hours (weekdays, 09:00–17:00 by default). The revert-based defect metric only detects GitHub Revert PRs and is a lower-bound signal. These are process signals, not individual performance ratings; do not use them to rank people or make performance decisions. Treat reports as potentially sensitive because they contain repository and reviewer information.
 
 ## Development and checks
 
