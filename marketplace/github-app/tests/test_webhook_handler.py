@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import os
 import sys
+from io import BytesIO
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
@@ -11,6 +12,46 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 import webhook_handler as wh  # noqa: E402
 
 import pr_latency_reporter as plr  # noqa: E402
+
+
+def test_read_bounded_body_accepts_complete_bounded_payload():
+    assert wh.read_bounded_body("4", BytesIO(b"body")) == b"body"
+
+
+def test_read_bounded_body_rejects_invalid_lengths_without_reading():
+    class Unreadable:
+        def read(self, _length):
+            raise AssertionError("invalid lengths must be rejected before reading")
+
+    for value in (None, "", "abc", "0", "-1", str(wh.MAX_REQUEST_BYTES + 1)):
+        assert wh.read_bounded_body(value, Unreadable()) is None
+
+
+def test_read_bounded_body_rejects_incomplete_payload():
+    assert wh.read_bounded_body("5", BytesIO(b"short"[:3])) is None
+
+
+def test_read_bounded_body_enforces_total_deadline(monkeypatch):
+    times = iter((0, 0, 5, 11))
+    monkeypatch.setattr(wh.time, "monotonic", lambda: next(times))
+
+    class SlowStream:
+        def __init__(self):
+            self.chunks = iter((b"a", b"b"))
+
+        def read1(self, _length):
+            return next(self.chunks)
+
+    class Connection:
+        def __init__(self):
+            self.timeouts = []
+
+        def settimeout(self, timeout):
+            self.timeouts.append(timeout)
+
+    connection = Connection()
+    assert wh.read_bounded_body("3", SlowStream(), connection) is None
+    assert connection.timeouts == [10, 5]
 
 
 def test_verify_signature_accepts_correct_hmac():

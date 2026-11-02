@@ -15,6 +15,9 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v7
 
@@ -24,10 +27,10 @@ jobs:
           enable-cache: true
 
       - name: Set up Python
-        run: uv python install 3.12
+        run: uv python install ${{ matrix.python-version }}
 
       - name: Install
-        run: uv sync --dev
+        run: uv sync --locked --dev
 
       # 1. Lint (ruff) — fastest failure.
       - name: Lint

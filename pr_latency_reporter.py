@@ -7,9 +7,8 @@ third-party dependencies, so the pure metric logic is fully testable with no
 network and no secrets.
 
 Default run takes no arguments: it detects the datastore, resumes from the last
-cursor, pulls only new/updated PRs, recomputes aggregates, and posts the Friday
-Slack digest / month-end Markdown summary when due. Use ``--backfill YYYY-MM-DD``
-once to seed history and ``--dry-run`` to print instead of posting to Slack.
+cursor, pulls only new/updated PRs, and saves reports locally. Slack posting is
+available only when explicitly requested with ``--post-slack``.
 
 Metric definitions follow the project's Metrics Reference exactly: all latencies
 are measured in *business hours* (09:00-17:00 Mon-Fri, excluding weekends and
@@ -60,7 +59,7 @@ REVIEWER_SENIORITY = "" or os.getenv("REVIEWER_SENIORITY", "")
 # referencing the merge commit still counts as a defect escape.
 DEFECT_LOOKBACK_DAYS = int(os.getenv("DEFECT_LOOKBACK_DAYS", "14"))
 
-# Slack (required to post; bypassed by --dry-run)
+# Slack (used only with --post-slack)
 SLACK_BOT_TOKEN = "" or os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_ID = "" or os.getenv("SLACK_CHANNEL_ID", "")
 SLACK_API = os.getenv("SLACK_API", "https://slack.com/api")
@@ -1470,6 +1469,7 @@ def run(
     now: datetime | None = None,
     backfill: date | None = None,
     dry_run: bool = False,
+    post_slack_enabled: bool = False,
     collector: Callable[[Config, datetime], CollectResult] = collect_prs,
 ) -> dict:
     """Execute one reporting cycle. Returns a small summary dict of what happened."""
@@ -1510,10 +1510,17 @@ def run(
             team_aggs = aggregate_by_team(week_records, cfg)
             text = render_weekly_digest(agg, week_label, cfg, team_aggs=team_aggs)
             if dry_run:
-                print("--- DRY RUN: weekly Slack digest ---")
+                print("--- DRY RUN: weekly report ---")
                 print(text)
             else:
-                post_slack(cfg, text)
+                out_dir = os.path.join(cfg.data_dir, "summaries")
+                os.makedirs(out_dir, exist_ok=True)
+                with open(
+                    os.path.join(out_dir, f"weekly-{week_label}.md"), "w", encoding="utf-8"
+                ) as fh:
+                    fh.write(text)
+                if post_slack_enabled:
+                    post_slack(cfg, text)
                 store.mark_sent("weekly", week_label, collected_at)
             actions["weekly"] = week_label
 
@@ -1560,10 +1567,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="YYYY-MM-DD",
         help="One-off backfill start date (otherwise resume from the stored cursor).",
     )
-    parser.add_argument(
+    output_mode = parser.add_mutually_exclusive_group()
+    output_mode.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the digest/summary instead of posting to Slack or writing files.",
+        help="Print due reports without writing report files or posting to Slack.",
+    )
+    output_mode.add_argument(
+        "--post-slack",
+        action="store_true",
+        help="Also post the weekly digest to Slack (requires Slack credentials).",
     )
     return parser
 
@@ -1572,7 +1585,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     cfg = load_config()
 
-    missing = cfg.missing_required(need_slack=not args.dry_run)
+    missing = cfg.missing_required(need_slack=args.post_slack)
     if missing:
         print(
             "Missing required configuration: " + ", ".join(missing) + ".\n"
@@ -1589,7 +1602,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("--backfill must be YYYY-MM-DD", file=sys.stderr)
             return 2
 
-    actions = run(cfg, backfill=backfill, dry_run=args.dry_run)
+    actions = run(cfg, backfill=backfill, dry_run=args.dry_run, post_slack_enabled=args.post_slack)
     print(
         f"Collected {actions['collected']} PR(s). "
         f"Weekly: {actions['weekly'] or 'not due'}. "
