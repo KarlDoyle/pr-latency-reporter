@@ -1,8 +1,8 @@
 [project]
 name = "pr-latency-reporter"
 version = "0.1.0"
-description = "Collect PR review-latency metrics from GitHub, store them append-only in SQLite, and emit a weekly Slack digest + monthly Markdown summary — standard library only."
-requires-python = ">=3.10"
+description = "Collect GitHub pull request review-latency metrics and save local Markdown reports — standard library only."
+requires-python = ">=3.11"
 dependencies = []
 
 [dependency-groups]

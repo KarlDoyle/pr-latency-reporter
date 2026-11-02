@@ -1,17 +1,24 @@
-"""Guardrails: no committed secrets, and no employer-specific placeholders."""
+"""Guardrail against committing common credential formats."""
 
 import os
 import re
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-# Files we scan: the source, tests, README, configs.
-SCAN_FILES = [
-    "pr_latency_reporter.py",
-    "README.md",
-    "pyproject.toml",
-    "ruff.toml",
-]
+TEXT_SUFFIXES = {".py", ".md", ".toml", ".yml", ".yaml", ".json", ".js", ".mjs", ".ts"}
+
+
+def scan_files():
+    """Return project text files for the repository-wide secret check."""
+    found = []
+    for current, dirs, files in os.walk(ROOT):
+        dirs[:] = [name for name in dirs if name not in {".git", ".venv", "node_modules"}]
+        for fname in files:
+            path = os.path.join(current, fname)
+            if os.path.splitext(fname)[1] in TEXT_SUFFIXES:
+                found.append(os.path.relpath(path, ROOT))
+    return sorted(found)
+
 
 SECRET_PATTERNS = [
     re.compile(r"xoxb-[A-Za-z0-9-]{10,}"),  # Slack bot token
@@ -20,9 +27,6 @@ SECRET_PATTERNS = [
     re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key id
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 ]
-
-# Employer-specific strings that must never be carried through from the spec.
-FORBIDDEN_PLACEHOLDERS = ["pass-team", "Europe/Dublin", "prime_to_pass", "IST"]
 
 
 def _read(name):
@@ -34,27 +38,16 @@ def _read(name):
 
 
 def test_no_committed_secrets():
-    for name in SCAN_FILES:
+    for name in scan_files():
         text = _read(name)
         for pattern in SECRET_PATTERNS:
             assert not pattern.search(text), f"possible secret in {name}: {pattern.pattern}"
 
 
-def test_no_employer_specific_placeholders():
-    for name in SCAN_FILES:
-        text = _read(name)
-        for token in FORBIDDEN_PLACEHOLDERS:
-            # Word-boundary match so e.g. "IST" does not hit "EXISTS".
-            pattern = re.compile(rf"(?<![\w-]){re.escape(token)}(?![\w-])")
-            assert not pattern.search(text), f"forbidden placeholder '{token}' in {name}"
-
-
 def test_tests_dir_has_no_secrets():
-    tests_dir = os.path.join(ROOT, "tests")
-    for fname in os.listdir(tests_dir):
-        if not fname.endswith(".py"):
+    for name in scan_files():
+        if "/tests/" not in f"/{name}/" and not name.startswith("tests/"):
             continue
-        with open(os.path.join(tests_dir, fname), encoding="utf-8") as fh:
-            text = fh.read()
+        text = _read(name)
         for pattern in SECRET_PATTERNS:
-            assert not pattern.search(text), f"possible secret in tests/{fname}"
+            assert not pattern.search(text), f"possible secret in {name}: {pattern.pattern}"

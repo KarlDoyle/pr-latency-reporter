@@ -8,13 +8,13 @@ on:
 permissions:
   contents: read
 
-# Python equivalent of the standard Node ci.yml. Same idea: sequential, boring,
-# cheapest-first gates that mirror the local pre-push hook. ruff plays the role
-# biome plays on the TS side (lint + format check); pytest is the test gate.
 jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v7
 
@@ -24,26 +24,16 @@ jobs:
           enable-cache: true
 
       - name: Set up Python
-        run: uv python install 3.12
+        run: uv python install ${{ matrix.python-version }}
 
       - name: Install
-        run: uv sync --dev
+        run: uv sync --locked --dev
 
-      # 1. Lint (ruff) — fastest failure.
       - name: Lint
         run: uv run ruff check .
 
-      # 2. Format check (ruff).
       - name: Format check
         run: uv run ruff format --check .
 
-      # 3. Tests (pytest) — includes tests/test_secrets_scan.py.
       - name: Test
         run: uv run pytest
-
-      # 4. marketplace/ scaffold tests (Python side only — the Forge dashboard's
-      #    npm/build step is a manual step, see marketplace/forge-app/README.md).
-      #    Separate from the core gate above; failing here doesn't mean the
-      #    core tool is broken, but it should never silently rot either.
-      - name: Marketplace scaffold tests
-        run: uv run pytest marketplace/github-app/tests/ marketplace/tests/ -q

@@ -32,7 +32,8 @@ def make_fake_urlopen(routes):
     def fake_urlopen(request, *args, **kwargs):
         url = request.full_url
         # Never leak the token: assert it is set but not part of the matched URL.
-        assert "Authorization" in {k.title(): v for k, v in request.headers.items()} or True
+        headers = {k.title(): v for k, v in request.headers.items()}
+        assert headers.get("Authorization", "").startswith("Bearer ")
         for needle, payload in routes.items():
             if needle in url:
                 return FakeResponse(payload)
@@ -229,11 +230,60 @@ def test_run_dry_run_with_injected_collector(monkeypatch, cfg, tmp_path, capsys)
         ]
         return plr.CollectResult(records=[record], review_events=review_events)
 
-    # Friday 16:00 -> weekly digest due; dry-run prints instead of posting.
+    # Friday 16:00 -> weekly report due; dry-run prints without writing.
     now = datetime(2026, 1, 9, 16, 0, tzinfo=TZ)
     actions = plr.run(cfg, now=now, dry_run=True, collector=fake_collector)
     assert actions["collected"] == 1
     assert actions["weekly"] == "2026-W02"
     out = capsys.readouterr().out
-    assert "DRY RUN: weekly Slack digest" in out
+    assert "DRY RUN: weekly report" in out
     assert "Weekly PR Review Metrics (2026-W02)" in out
+    assert not (tmp_path / "summaries").exists()
+
+
+def test_run_writes_weekly_report_without_slack_by_default(monkeypatch, cfg, tmp_path):
+    cfg.data_dir = str(tmp_path)
+
+    def fake_collector(_cfg, _since):
+        return plr.CollectResult(records=[], review_events=[])
+
+    def unexpected_slack(*_args):
+        raise AssertionError("Slack must be opt-in")
+
+    monkeypatch.setattr(plr, "post_slack", unexpected_slack)
+    plr.run(
+        cfg,
+        now=datetime(2026, 1, 9, 16, 0, tzinfo=TZ),
+        collector=fake_collector,
+    )
+    report = tmp_path / "summaries" / "weekly-2026-W02.md"
+    assert report.exists()
+    assert "Weekly PR Review Metrics (2026-W02)" in report.read_text()
+
+
+def test_run_posts_weekly_report_when_explicitly_enabled(monkeypatch, cfg, tmp_path):
+    cfg.data_dir = str(tmp_path)
+    posted = []
+    monkeypatch.setattr(plr, "post_slack", lambda _cfg, text: posted.append(text))
+    plr.run(
+        cfg,
+        now=datetime(2026, 1, 9, 16, 0, tzinfo=TZ),
+        post_slack_enabled=True,
+        collector=lambda _cfg, _since: plr.CollectResult(records=[], review_events=[]),
+    )
+    assert len(posted) == 1
+    assert "Weekly PR Review Metrics (2026-W02)" in posted[0]
+
+
+def test_cli_requires_slack_config_only_when_opted_in(monkeypatch, cfg, capsys):
+    cfg.slack_bot_token = ""
+    cfg.slack_channel_id = ""
+    monkeypatch.setattr(plr, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        plr,
+        "run",
+        lambda *_args, **_kwargs: {"collected": 0, "weekly": None, "monthly": None},
+    )
+    assert plr.main([]) == 0
+    assert plr.main(["--post-slack"]) == 2
+    assert "SLACK_BOT_TOKEN" in capsys.readouterr().err
